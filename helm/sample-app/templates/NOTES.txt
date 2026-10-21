@@ -1,0 +1,6 @@
+sample-app deployed to namespace "{{ .Release.Namespace }}" ({{ .Values.env.APP_ENV }})
+Image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+
+Test it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "sample-app.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://localhost:8080/

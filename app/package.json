@@ -1,0 +1,17 @@
+{
+  "name": "sample-app",
+  "version": "1.0.0",
+  "description": "Sample Node.js app for GKE Helm CI/CD testing (dev / qa / prod)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

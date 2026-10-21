@@ -1,0 +1,17 @@
+# QA environment - branch: qa -> namespace: qa
+replicaCount: 1
+
+env:
+  APP_ENV: qa
+  APP_MESSAGE: "Hello from QA"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false

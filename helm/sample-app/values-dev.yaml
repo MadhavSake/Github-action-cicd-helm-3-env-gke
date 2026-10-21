@@ -1,0 +1,17 @@
+# DEV environment - branch: dev -> namespace: dev
+replicaCount: 1
+
+env:
+  APP_ENV: dev
+  APP_MESSAGE: "Hello from DEV"
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 48Mi
+  limits:
+    cpu: 100m
+    memory: 96Mi
+
+autoscaling:
+  enabled: false

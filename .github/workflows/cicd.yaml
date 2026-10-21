@@ -1,0 +1,179 @@
+name: CI/CD - GKE Helm (dev / qa / prod)
+
+# Branch -> environment -> namespace mapping
+#   dev  branch -> GitHub environment "dev"  -> namespace "dev"
+#   qa   branch -> GitHub environment "qa"   -> namespace "qa"
+#   prod branch -> GitHub environment "prod" -> namespace "prod"  (add required reviewers on this environment)
+
+on:
+  push:
+    branches: [dev, qa, prod]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    branches: [dev, qa, prod]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # needed for Workload Identity Federation (keyless auth to GCP)
+
+env:
+  PROJECT_ID: madhav-test-471011
+  REGION: asia-south1
+  GAR_REPO: sample-app-repo
+  IMAGE_NAME: sample-app
+  CLUSTER_NAME: madhav-test-gke
+  CLUSTER_LOCATION: asia-south1-a
+  RELEASE_NAME: sample-app
+  CHART_PATH: helm/sample-app
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. Unit test the app + lint/render the Helm chart for all 3 envs
+  # ------------------------------------------------------------------
+  test:
+    name: Test & Helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install & test app
+        working-directory: app
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Helm lint & template (dev / qa / prod)
+        run: |
+          for ENV in dev qa prod; do
+            echo "::group::helm lint + template -> $ENV"
+            helm lint "$CHART_PATH" -f "$CHART_PATH/values.yaml" -f "$CHART_PATH/values-$ENV.yaml"
+            helm template "$RELEASE_NAME" "$CHART_PATH" -n "$ENV" \
+              -f "$CHART_PATH/values.yaml" -f "$CHART_PATH/values-$ENV.yaml" \
+              --set image.tag=ci-check > /dev/null
+            echo "::endgroup::"
+          done
+
+  # ------------------------------------------------------------------
+  # 2. Build the Docker image and push it to Artifact Registry
+  #    (skipped on PRs and until GCP repo variables are configured)
+  # ------------------------------------------------------------------
+  build-push:
+    name: Build & push image
+    needs: test
+    if: >-
+      github.event_name != 'pull_request' &&
+      contains(fromJSON('["dev","qa","prod"]'), github.ref_name) &&
+      vars.WIF_PROVIDER != ''
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name & tag
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPO}/${IMAGE_NAME}"
+          TAG="${GITHUB_REF_NAME}-${SHORT_SHA}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "Image: $IMAGE:$TAG"
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: app/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:${{ github.ref_name }}-latest
+          cache-from: type=gha,scope=${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ github.ref_name }}
+
+  # ------------------------------------------------------------------
+  # 3. Deploy with Helm to the namespace matching the branch
+  # ------------------------------------------------------------------
+  deploy:
+    name: Deploy to ${{ github.ref_name }}
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name }}
+    concurrency:
+      group: deploy-${{ github.ref_name }}
+      cancel-in-progress: false
+    env:
+      NAMESPACE: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_LOCATION }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Helm upgrade --install
+        run: |
+          helm upgrade --install "$RELEASE_NAME" "$CHART_PATH" \
+            --namespace "$NAMESPACE" --create-namespace \
+            -f "$CHART_PATH/values.yaml" \
+            -f "$CHART_PATH/values-$NAMESPACE.yaml" \
+            --set image.repository="${{ needs.build-push.outputs.image }}" \
+            --set image.tag="${{ needs.build-push.outputs.tag }}" \
+            --atomic --wait --timeout 5m \
+            --history-max 5
+
+      - name: Verify rollout
+        run: |
+          kubectl -n "$NAMESPACE" rollout status deployment/"$RELEASE_NAME" --timeout=120s
+          kubectl -n "$NAMESPACE" get deploy,pods,svc -l app.kubernetes.io/instance="$RELEASE_NAME" -o wide
+          helm -n "$NAMESPACE" history "$RELEASE_NAME" --max 5
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed :rocket:"
+            echo "| Env | Namespace | Image |"
+            echo "|---|---|---|"
+            echo "| ${GITHUB_REF_NAME} | ${NAMESPACE} | \`${{ needs.build-push.outputs.image }}:${{ needs.build-push.outputs.tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
